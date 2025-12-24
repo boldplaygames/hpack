@@ -6,17 +6,6 @@ import (
 	"sort"
 )
 
-// var (
-// 	mapStringInterfacePtrType = reflect.TypeOf((*map[string]interface{})(nil))
-// 	mapStringInterfaceType    = mapStringInterfacePtrType.Elem()
-// )
-// var (
-// 	mapStringStringPtrType = reflect.TypeOf((*map[string]string)(nil))
-// 	mapStringStringType    = mapStringStringPtrType.Elem()
-// 	mapStringBoolPtrType   = reflect.TypeOf((*map[string]bool)(nil))
-// 	mapStringBoolType      = mapStringBoolPtrType.Elem()
-// )
-
 func encodeMapStringInterfaceValue(e *Encoder, v reflect.Value) error {
 	if v.IsNil() {
 		return e.EncodeNil()
