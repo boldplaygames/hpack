@@ -1,4 +1,4 @@
-module github.com/hpack
+module github.com/boldplaygames/hpack
 
 go 1.25.4
 
