@@ -1,0 +1,444 @@
+package hpack
+
+import (
+	"encoding"
+	"fmt"
+	"log"
+	"reflect"
+	"sync"
+
+	"github.com/vmihailenco/tagparser/v2"
+)
+
+var errorType = reflect.TypeOf((*error)(nil)).Elem()
+
+var (
+	customEncoderType = reflect.TypeOf((*CustomEncoder)(nil)).Elem()
+	customDecoderType = reflect.TypeOf((*CustomDecoder)(nil)).Elem()
+)
+var (
+	marshalerType   = reflect.TypeOf((*Marshaler)(nil)).Elem()
+	unmarshalerType = reflect.TypeOf((*Unmarshaler)(nil)).Elem()
+)
+
+var (
+	binaryMarshalerType   = reflect.TypeOf((*encoding.BinaryMarshaler)(nil)).Elem()
+	binaryUnmarshalerType = reflect.TypeOf((*encoding.BinaryUnmarshaler)(nil)).Elem()
+)
+
+var (
+	textMarshalerType   = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
+	textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
+)
+
+var (
+	interfaceType = reflect.TypeOf((*interface{})(nil)).Elem()
+	stringType    = reflect.TypeOf((*string)(nil)).Elem()
+	boolType      = reflect.TypeOf((*bool)(nil)).Elem()
+)
+var stringSliceType = reflect.TypeOf(([]string)(nil))
+
+type (
+	encoderFunc func(*Encoder, reflect.Value) error
+	decoderFunc func(*Decoder, reflect.Value) error
+)
+
+var (
+	typeEncMap sync.Map
+	typeDecMap sync.Map
+)
+
+// Register registers encoder and decoder functions for a value.
+// This is low level API and in most cases you should prefer implementing
+// CustomEncoder/CustomDecoder or Marshaler/Unmarshaler interfaces.
+func Register(value interface{}, enc encoderFunc, dec decoderFunc) {
+	typ := reflect.TypeOf(value)
+	if enc != nil {
+		typeEncMap.Store(typ, enc)
+	}
+	if dec != nil {
+		typeDecMap.Store(typ, dec)
+	}
+}
+
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+
+type Field struct {
+	encoder   encoderFunc
+	decoder   decoderFunc
+	index     []int
+	omitEmpty bool
+	fieldName FieldName
+}
+type FieldName struct {
+	name   string
+	hash32 uint32            // 최종 할당된 해시값 (1, 2, 4 바이트 중 하나)
+	size   FieldNameSizeFlag // 최종 할당된 해시 크기 Flag
+}
+
+func (f FieldName) GetName() string                { return f.name }
+func (f FieldName) GetHash32() uint32              { return f.hash32 }
+func (f FieldName) GetSizeFlag() FieldNameSizeFlag { return f.size }
+
+func (f *Field) Omit(e *Encoder, strct reflect.Value) bool {
+	v, ok := fieldByIndex(strct, f.index)
+	if !ok {
+		return true
+	}
+	forced := e.flags&omitEmptyFlag != 0
+	return (f.omitEmpty || forced) && e.isEmptyValue(v)
+	// return f.omitEmpty && e.isEmptyValue(v)
+}
+
+func (f *Field) EncodeValue(e *Encoder, strct reflect.Value) error {
+	v, ok := fieldByIndex(strct, f.index)
+	if !ok {
+		return e.EncodeNil()
+	}
+	return f.encoder(e, v)
+}
+
+func (f *Field) DecodeValue(d *Decoder, strct reflect.Value) error {
+	v := fieldByIndexAlloc(strct, f.index)
+	return f.decoder(d, v)
+}
+
+//------------------------------------------------------------------------------
+
+func newFields(typ reflect.Type) *fields {
+	return &fields{
+		Type: typ,
+		Map:  make(map[uint32]*Field, typ.NumField()),
+		List: make([]*Field, 0, typ.NumField()),
+	}
+}
+
+func (fs *fields) Add(field *Field) {
+	if _, ok := fs.Map[field.fieldName.hash32]; ok {
+		fmt.Errorf("hpack: %s already has field=%v(%s)", fs.Type, field.fieldName.hash32, field.fieldName.name)
+
+		return
+	}
+
+	fs.Map[field.fieldName.hash32] = field
+	fs.List = append(fs.List, field)
+	if field.omitEmpty {
+		fs.hasOmitEmpty = true
+	}
+}
+
+func (fs *fields) OmitEmpty(e *Encoder, strct reflect.Value) []*Field {
+	forced := e.flags&omitEmptyFlag != 0
+	if !fs.hasOmitEmpty && !forced {
+		// if !fs.hasOmitEmpty {
+		return fs.List
+	}
+
+	fields := make([]*Field, 0, len(fs.List))
+
+	for _, f := range fs.List {
+		if !f.Omit(e, strct) {
+			fields = append(fields, f)
+		}
+	}
+
+	return fields
+}
+
+func fold32to8(h uint32) uint32 {
+	v := uint8((h >> 24) ^ (h >> 16) ^ (h >> 8) ^ h)
+	return uint32(v) // 0x000000XX
+}
+
+func fold32to16(h uint32) uint32 {
+	v := uint16((h >> 16) ^ (h & 0xFFFF))
+	return uint32(v) // 0x0000XXXX
+}
+
+func (fs *fields) getHashcode(nameStr string, rqSize FieldNameSizeFlag) uint32 {
+	h32 := CRC32Hash(nameStr) // CRC-32 사용
+
+	var hashcode uint32 = 0
+
+	switch rqSize {
+	case FieldNameSizeFlag1Byte:
+		hashcode = fold32to8(h32)
+	case FieldNameSizeFlag2Byte:
+		hashcode = fold32to16(h32)
+	case FieldNameSizeFlag4Byte:
+		hashcode = h32
+	default:
+		fmt.Errorf("getHashcode invalid size flag:%d, %s", rqSize, nameStr)
+		return hashcode
+	}
+
+	if _, ok := fs.Map[hashcode]; !ok { // unique
+		return hashcode
+	}
+
+	return 0
+}
+
+func getFields(typ reflect.Type) *fields {
+	fs := newFields(typ)
+	var omitEmpty bool
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+
+		tagStr := f.Tag.Get(defaultStructTag)
+		// if tagStr == "" && fallbackTag != "" {
+		// 	tagStr = f.Tag.Get(fallbackTag)
+		// }
+
+		tag := tagparser.Parse(tagStr)
+		if tag.Name == "-" {
+			continue
+		}
+
+		// if f.Name == "_msgpack" {
+		// 	fs.AsArray = tag.HasOption("as_array") || tag.HasOption("asArray")
+		// 	if tag.HasOption("omitempty") {
+		// 		omitEmpty = true
+		// 	}
+		// }
+
+		if f.PkgPath != "" && !f.Anonymous {
+			continue
+		}
+
+		field := &Field{
+			fieldName: FieldName{
+				name: tag.Name,
+			},
+			index:     f.Index,
+			omitEmpty: omitEmpty || tag.HasOption("omitempty"),
+		}
+		if field.fieldName.name == "" {
+			field.fieldName.name = f.Name
+		}
+
+		for _, sizeFlag := range fieldNameSizeFlagValues {
+			hcode := fs.getHashcode(field.fieldName.name, sizeFlag)
+			if hcode == 0 { // 중복이면 다시 getHashcode
+				fmt.Printf("getFields hash collision for field %s with size %d, try next size", field.fieldName.name, sizeFlag)
+				continue
+			}
+
+			field.fieldName.hash32 = hcode
+			field.fieldName.size = sizeFlag
+			break
+		}
+
+		field.encoder = getEncoder(f.Type)
+		field.decoder = getDecoder(f.Type)
+		/*
+			if tag.HasOption("intern") {
+				switch f.Type.Kind() {
+				case reflect.Interface:
+					field.encoder = encodeInternedInterfaceValue
+					field.decoder = decodeInternedInterfaceValue
+				case reflect.String:
+					field.encoder = encodeInternedStringValue
+					field.decoder = decodeInternedStringValue
+				default:
+					err := fmt.Errorf("hpack: intern strings are not supported on %s", f.Type)
+					panic(err)
+				}
+			} else {
+				field.encoder = getEncoder(f.Type)
+				field.decoder = getDecoder(f.Type)
+			}
+		*/
+
+		// Embeded struct를 인라인 처리
+		if f.Anonymous && !tag.HasOption("noinline") {
+			inline := tag.HasOption("inline")
+			if inline {
+				inlineFields(fs, f.Type, field)
+			} else {
+				inline = shouldInline(fs, f.Type, field)
+			}
+
+			if inline {
+				if _, ok := fs.Map[field.fieldName.hash32]; ok {
+					log.Printf("hpack: %s already has field=%s", fs.Type, field.fieldName.name)
+				}
+				fs.Map[field.fieldName.hash32] = field
+				continue
+			}
+		}
+
+		fs.Add(field)
+
+		// if alias, ok := tag.Options["alias"]; ok {
+		// 	fs.warnIfFieldExists(alias)
+		// 	fs.Map[alias] = field
+		// }
+	}
+	return fs
+}
+
+func fieldByIndex(v reflect.Value, index []int) (_ reflect.Value, ok bool) {
+	// v는 struct
+	if len(index) == 1 { // return field directly
+		return v.Field(index[0]), true
+	}
+
+	for i, idx := range index {
+		if i > 0 { // nested fields
+			if v.Kind() == reflect.Pointer {
+				if v.IsNil() {
+					return v, false
+				}
+				v = v.Elem() // dereference ptr
+			}
+		}
+		v = v.Field(idx)
+	}
+
+	return v, true
+}
+
+func fieldByIndexAlloc(v reflect.Value, index []int) reflect.Value {
+	if len(index) == 1 {
+		return v.Field(index[0])
+	}
+
+	for i, idx := range index {
+		if i > 0 {
+			var ok bool
+			v, ok = indirectNil(v)
+			if !ok {
+				return v
+			}
+		}
+		v = v.Field(idx)
+	}
+
+	return v
+}
+
+func indirectNil(v reflect.Value) (reflect.Value, bool) {
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			if !v.CanSet() {
+				return v, false
+			}
+			elemType := v.Type().Elem()
+			if elemType.Kind() != reflect.Struct {
+				return v, false
+			}
+			v.Set(cachedValue(elemType))
+		}
+		v = v.Elem()
+	}
+	return v, true
+}
+
+type isZeroer interface {
+	IsZero() bool
+}
+
+func (e *Encoder) isEmptyValue(v reflect.Value) bool {
+	kind := v.Kind()
+
+	for kind == reflect.Interface {
+		if v.IsNil() {
+			return true
+		}
+		v = v.Elem()
+		kind = v.Kind()
+	}
+
+	if z, ok := v.Interface().(isZeroer); ok {
+		return nilable(kind) && v.IsNil() || z.IsZero()
+	}
+
+	switch kind {
+	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
+		return v.Len() == 0
+	case reflect.Struct:
+		// structFields := structs.Fields(v.Type(), e.structTag)
+		structFields := structs.Fields(v.Type())
+		fields := structFields.OmitEmpty(e, v)
+		return len(fields) == 0
+	case reflect.Bool:
+		return !v.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int() == 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v.Uint() == 0
+	case reflect.Float32, reflect.Float64:
+		return v.Float() == 0
+	case reflect.Pointer:
+		return v.IsNil()
+	default:
+		return false
+	}
+}
+
+var (
+	encodeStructValuePtr uintptr
+	decodeStructValuePtr uintptr
+)
+
+//nolint:gochecknoinits
+func init() {
+	encodeStructValuePtr = reflect.ValueOf(encodeStructValue).Pointer()
+	decodeStructValuePtr = reflect.ValueOf(decodeStructValue).Pointer()
+}
+
+func inlineFields(fs *fields, typ reflect.Type, f *Field) {
+	inlinedFields := getFields(typ).List
+	for _, field := range inlinedFields {
+		if _, ok := fs.Map[field.fieldName.hash32]; ok {
+			// Don't inline shadowed fields.
+			continue
+		}
+		field.index = append(f.index, field.index...)
+		fs.Add(field)
+	}
+}
+
+func shouldInline(fs *fields, typ reflect.Type, f *Field) bool {
+	var encoder encoderFunc
+	var decoder decoderFunc
+
+	if typ.Kind() == reflect.Struct {
+		encoder = f.encoder
+		decoder = f.decoder
+	} else {
+		for typ.Kind() == reflect.Pointer {
+			typ = typ.Elem()
+			encoder = getEncoder(typ)
+			decoder = getDecoder(typ)
+		}
+		if typ.Kind() != reflect.Struct {
+			return false
+		}
+	}
+
+	if reflect.ValueOf(encoder).Pointer() != encodeStructValuePtr {
+		return false
+	}
+	if reflect.ValueOf(decoder).Pointer() != decodeStructValuePtr {
+		return false
+	}
+
+	inlinedFields := getFields(typ).List
+	for _, field := range inlinedFields {
+		if _, ok := fs.Map[field.fieldName.hash32]; ok {
+			// Don't auto inline if there are shadowed fields.
+			return false
+		}
+	}
+
+	for _, field := range inlinedFields {
+		field.index = append(f.index, field.index...)
+		fmt.Printf("%s shouldInline adding field %s", typ.Name(), field.fieldName.name)
+		fs.Add(field)
+	}
+	return true
+}
