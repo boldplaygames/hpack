@@ -2,7 +2,6 @@ package hpack
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"reflect"
 	"sync"
@@ -164,45 +163,15 @@ func (e *Encoder) EncodeBool(value bool) error {
 	}
 	return e.writeCode(False)
 }
+func (f *Field) encodeFieldName(e *Encoder, fieldLen FieldNameSizeFlag) error {
+	buf, err := f.fieldName.toBuffer(fieldLen)
+	if err != nil {
+		return err
+	}
+	return e.write(buf)
+}
 
 // encodeFieldName: 문자열 필드명을 Header를 붙인 Hashcode로 변환
-func (e *Encoder) encodeFieldName(fieldName FieldName) error {
-	szFlag := fieldName.GetSizeFlag()
-	h32 := fieldName.GetHash32()
-
-	// header(8bit): 필드명size(2bit), 빈 공간(6bit)
-	e.writeCode(byte(szFlag))
-
-	buf := make([]byte, 0, szFlag.ToSize())
-	// buf := make([]byte, 0, szFlag.ToSize())
-
-	switch szFlag {
-	case FieldNameSizeFlag1Byte:
-		buf = append(buf, byte(h32&Hex1Byte))
-
-	case FieldNameSizeFlag2Byte:
-		buf = append(buf,
-			byte((h32>>8)&Hex1Byte),
-			byte(h32&Hex1Byte),
-		)
-
-	case FieldNameSizeFlag4Byte:
-		buf = append(buf,
-			byte(h32>>24),
-			byte(h32>>16),
-			byte(h32>>8),
-			byte(h32),
-		)
-	default:
-		return fmt.Errorf("invalid hash size: %d", szFlag)
-	}
-
-	// logc.Trace().Msgf("encodeFieldName(%s):: size(%s) hash(%b) %d", fieldName.name, szFlag.ToString(), buf[:], len(buf))
-
-	e.write(buf)
-
-	return nil
-}
 
 //
 

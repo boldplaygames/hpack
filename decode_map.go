@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"slices"
 
 	"github.com/vmihailenco/msgpack/v5/msgpcode"
 )
@@ -289,8 +288,23 @@ func (d *Decoder) skipMap(c byte) error {
 	return nil
 }
 
+func (d *Decoder) decodeFieldLen() (FieldNameSizeFlag, error) {
+	c, err := d.readCode()
+	if err != nil {
+		return 0, err
+	}
+
+	sizeFlag := FieldNameSizeFlag(c)
+
+	if sizeFlag.ToSize() > 0 {
+		return sizeFlag, nil
+	}
+	return 0, unexpectedCodeError{code: c, hint: "field length"}
+}
+
 func decodeStructValue(d *Decoder, v reflect.Value) error {
 
+	// map length
 	c, err := d.readCode()
 	if err != nil {
 		return err
@@ -298,7 +312,15 @@ func decodeStructValue(d *Decoder, v reflect.Value) error {
 
 	n, err := d.mapLen(c)
 	if err == nil {
-		return d.decodeStruct(v, n)
+
+		// field hashcode length
+		// 🔴CAUTION: msgpack에 없는 포맷
+		fieldLen, err := d.decodeFieldLen()
+		if err != nil {
+			return err
+		}
+
+		return d.decodeStruct(v, n, fieldLen)
 	}
 
 	var err2 error
@@ -326,7 +348,7 @@ func decodeStructValue(d *Decoder, v reflect.Value) error {
 	return nil
 }
 
-func (d *Decoder) decodeStruct(v reflect.Value, n int) error {
+func (d *Decoder) decodeStruct(v reflect.Value, n int, fieldLen FieldNameSizeFlag) error {
 
 	if n == -1 {
 		v.Set(reflect.Zero(v.Type()))
@@ -336,7 +358,7 @@ func (d *Decoder) decodeStruct(v reflect.Value, n int) error {
 	fields := structs.Fields(v.Type())
 
 	for range n {
-		fname, err := d.decodeFieldName()
+		fname, err := d.decodeFieldName(fieldLen)
 		if err != nil {
 			return err
 		}
@@ -347,13 +369,13 @@ func (d *Decoder) decodeStruct(v reflect.Value, n int) error {
 			}
 			continue
 		} else {
-			fmt.Printf("decodeStruct: unknown field %q(%b) in struct %s", fname.size.ToString(), fname.hash32, v.Type().String())
+			fmt.Printf("decodeStruct: unknown field %q(%b) in struct %s\n", fname.size.ToString(), fname.hash32, v.Type().String())
 		}
 
 		if d.flags&disallowUnknownFieldsFlag != 0 {
 			return fmt.Errorf("hpack: unknown field %q", fname.hash32)
 		}
-		fmt.Printf("Skipping unknown field %q(%b) in struct %s", fname.size.ToString(), fname.hash32, v.Type().String())
+		fmt.Printf("Skipping unknown field %q(%b) in struct %s\n", fname.size.ToString(), fname.hash32, v.Type().String())
 		if err := d.Skip(); err != nil {
 			return err
 		}
@@ -362,18 +384,13 @@ func (d *Decoder) decodeStruct(v reflect.Value, n int) error {
 	return nil
 }
 
-func (d *Decoder) decodeFieldName() (fname FieldName, err error) {
+func (d *Decoder) decodeFieldName(sizeFlag FieldNameSizeFlag) (fname FieldName, err error) {
 	// if intern := d.flags&useInternedStringsFlag != 0; intern || len(d.dict) > 0 {
 	// 	return d.decodeInternedString(intern)
 	// }
 
-	c, err := d.readCode()
-	if err != nil {
-		return fname, err
-	}
-	sizeFlag := FieldNameSizeFlag(c)
-	if !slices.Contains(fieldNameSizeFlagValues, sizeFlag) {
-		return fname, fmt.Errorf("hpack: invalid code=%x decoding field name", sizeFlag)
+	if sizeFlag.ToSize() <= 0 {
+		return fname, fmt.Errorf("hpack: invalid field name size flag: %v", sizeFlag)
 	}
 
 	b, err := readN(d.r, nil, sizeFlag.ToSize())

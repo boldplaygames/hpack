@@ -75,12 +75,40 @@ type Field struct {
 type FieldName struct {
 	name   string
 	hash32 uint32            // 최종 할당된 해시값 (1, 2, 4 바이트 중 하나)
-	size   FieldNameSizeFlag // 최종 할당된 해시 크기 Flag
+	size   FieldNameSizeFlag // 최종 할당된 해시 크기 Flag. 필드 중 최대값으로 사용
 }
 
 func (f FieldName) GetName() string                { return f.name }
 func (f FieldName) GetHash32() uint32              { return f.hash32 }
 func (f FieldName) GetSizeFlag() FieldNameSizeFlag { return f.size }
+func (f FieldName) toBuffer(fieldLen FieldNameSizeFlag) (buf []byte, err error) {
+	// if fieldLen.ToSize() > f.size.ToSize() {
+	// 	fmt.Printf("field name size %d is smaller than required %d\n", f.size.ToSize(), fieldLen.ToSize())
+	// }
+	buf = make([]byte, 0, fieldLen.ToSize())
+
+	switch fieldLen {
+	case FieldNameSizeFlag1Byte:
+		buf = append(buf, byte(f.hash32&0xFF))
+
+	case FieldNameSizeFlag2Byte:
+		buf = append(buf,
+			byte((f.hash32>>8)&0xFF),
+			byte(f.hash32&0xFF),
+		)
+
+	case FieldNameSizeFlag4Byte:
+		buf = append(buf,
+			byte(f.hash32>>24),
+			byte(f.hash32>>16),
+			byte(f.hash32>>8),
+			byte(f.hash32),
+		)
+	default:
+		return nil, fmt.Errorf("invalid hash size: %d", f.size)
+	}
+	return buf, nil
+}
 
 func (f *Field) Omit(e *Encoder, strct reflect.Value) bool {
 	v, ok := fieldByIndex(strct, f.index)
@@ -117,7 +145,7 @@ func newFields(typ reflect.Type) *fields {
 
 func (fs *fields) Add(field *Field) {
 	if _, ok := fs.Map[field.fieldName.hash32]; ok {
-		fmt.Errorf("hpack: %s already has field=%v(%s)", fs.Type, field.fieldName.hash32, field.fieldName.name)
+		fmt.Printf("hpack: %s already has field=%v(%s)\n", fs.Type, field.fieldName.hash32, field.fieldName.name)
 
 		return
 	}
@@ -132,7 +160,6 @@ func (fs *fields) Add(field *Field) {
 func (fs *fields) OmitEmpty(e *Encoder, strct reflect.Value) []*Field {
 	forced := e.flags&omitEmptyFlag != 0
 	if !fs.hasOmitEmpty && !forced {
-		// if !fs.hasOmitEmpty {
 		return fs.List
 	}
 
@@ -170,7 +197,7 @@ func (fs *fields) getHashcode(nameStr string, rqSize FieldNameSizeFlag) uint32 {
 	case FieldNameSizeFlag4Byte:
 		hashcode = h32
 	default:
-		fmt.Errorf("getHashcode invalid size flag:%d, %s", rqSize, nameStr)
+		fmt.Printf("getHashcode invalid size flag:%d, %s \n", rqSize, nameStr)
 		return hashcode
 	}
 
@@ -222,7 +249,7 @@ func getFields(typ reflect.Type) *fields {
 		for _, sizeFlag := range fieldNameSizeFlagValues {
 			hcode := fs.getHashcode(field.fieldName.name, sizeFlag)
 			if hcode == 0 { // 중복이면 다시 getHashcode
-				fmt.Printf("getFields hash collision for field %s with size %d, try next size", field.fieldName.name, sizeFlag)
+				fmt.Printf("getFields hash collision for field %s with size %d, try next size\n", field.fieldName.name, sizeFlag)
 				continue
 			}
 
@@ -437,7 +464,6 @@ func shouldInline(fs *fields, typ reflect.Type, f *Field) bool {
 
 	for _, field := range inlinedFields {
 		field.index = append(f.index, field.index...)
-		fmt.Printf("%s shouldInline adding field %s", typ.Name(), field.fieldName.name)
 		fs.Add(field)
 	}
 	return true

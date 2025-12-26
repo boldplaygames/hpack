@@ -1,6 +1,7 @@
 package hpack
 
 import (
+	"fmt"
 	"math"
 	"reflect"
 	"sort"
@@ -97,6 +98,16 @@ func (e *Encoder) encodeMapLen(l int) error {
 	return e.write4(Map32, uint32(l))
 }
 
+func (e *Encoder) encodeFieldLen(fields []*Field) (fieldLen FieldNameSizeFlag, err error) {
+	fieldLen = maxFieldLen(fields)
+
+	if fieldLen.ToSize() <= 0 {
+		return fieldLen, fmt.Errorf("hpack: invalid field name size flag: %v", fieldLen)
+	}
+
+	return fieldLen, e.writeCode(byte(fieldLen))
+}
+
 func encodeMapValue(e *Encoder, v reflect.Value) error {
 	if v.IsNil() {
 		return e.EncodeNil()
@@ -119,20 +130,40 @@ func encodeMapValue(e *Encoder, v reflect.Value) error {
 	return nil
 }
 
+func maxFieldLen(fields []*Field) FieldNameSizeFlag {
+	l := FieldNameSizeFlag1Byte
+
+	for _, f := range fields {
+		if f.fieldName.GetSizeFlag().ToSize() > l.ToSize() {
+			l = f.fieldName.GetSizeFlag()
+		}
+	}
+	return l
+}
+
 func encodeStructValue(e *Encoder, strct reflect.Value) error {
 	structFields := structs.Fields(strct.Type())
 
 	fields := structFields.OmitEmpty(e, strct)
+
 	// logc.Trace().Msgf(" <<<<<<<<<<<<<<<< encodeStruct  %s  >>>>>>>>>>>>>>>>>>>> %d/%d", strct.Type().Name(), len(fields), len(structFields.List))
 
 	// logc.Trace().Msgf("getEncoder fields length: %d, struct %s", len(fields), strct.Type().Name())
 
+	// map length
 	if err := e.encodeMapLen(len(fields)); err != nil {
 		return err
 	}
 
+	// field hashcode length
+	// 🔴CAUTION: msgpack에 없는 포맷
+	fieldLen, err := e.encodeFieldLen(fields)
+	if err != nil {
+		return err
+	}
+
 	for _, f := range fields {
-		if err := e.encodeFieldName(f.fieldName); err != nil {
+		if err := f.encodeFieldName(e, fieldLen); err != nil {
 			return err
 		}
 		// beforeLen := e.w.Len()

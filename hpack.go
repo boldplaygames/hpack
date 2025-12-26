@@ -52,12 +52,6 @@ var fieldNameSizeFlagValues = []FieldNameSizeFlag{
 	FieldNameSizeFlag4Byte,
 }
 
-const (
-	Hex1Byte uint32 = 0xFF
-	// Hex2Byte uint32 = 0xFFFF
-	// Hex4Byte uint32 = 0xFFFFFFFF
-)
-
 const defaultStructTag = "msgpack"
 
 var structs = newStructCache()
